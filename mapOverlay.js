@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         S1914 Map Drawing Overlay (Synced via SignalR, Batched)
-// @namespace    mr-cool.s1914.cam-hud.drawing.synced
+// @namespace    1914.cam-hud.drawing.synced
 // @version      3.1.0
 // @description  Map drawing overlay with IDs, per-player visibility, batched create/delete to backend, and server-push sync
 // @match        https://www.supremacy1914.com/*
@@ -26,11 +26,6 @@
         ready: false,
         _pendingInvokes: [],
 
-        // We accumulate stuff to send on the next flush.
-        // Each entry in createQueue:
-        //   { gameID, playerID, playerColor, pathObj }
-        // Each entry in deleteQueue:
-        //   { gameID, playerID, pathUID }
         batchBuffers: {
             createQueue: [],
             deleteQueue: []
@@ -38,7 +33,6 @@
 
         /**
          * Queue a path to be created next flush.
-         * pathObj = { id, points:[{x,y},...], sent?, isFinal? }
          */
         queueCreatePath(gameID, playerID, playerColor, pathObj) {
             this.batchBuffers.createQueue.push({

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         S1914 Map Drawing Overlay (Synced via SignalR, Batched)
 // @namespace    1914.cam-hud.drawing.synced
-// @version      3.1.0
-// @description  Map drawing overlay with IDs, per-player visibility, batched create/delete to backend, and server-push sync
+// @version      3.5.0
+// @description  Map drawing overlay with IDs, per-player visibility, batched create/update/delete to backend, and server-push sync
 // @match        https://www.supremacy1914.com/*
 // @grant        none
 // @noframes
@@ -13,45 +13,155 @@
      * 0. CONFIG
      *****************************************************************/
     const CONFIG = {
-        BATCH_WAIT_SECONDS: 5, // how long after you stop drawing/erasing before we send batch
-        HUB_URL: 'https://powerboys.noxiaz.dk:5006/drawingHub' // backend SignalR hub
+        BATCH_WAIT_SECONDS: 5,
+        HUB_URL: 'https://powerboys.noxiaz.dk:5006/drawingHub'
     };
 
     /*****************************************************************
      * 1. BACKEND / SIGNALR
      *****************************************************************/
-
     const backend = {
         connection: null,
         ready: false,
         _pendingInvokes: [],
 
         batchBuffers: {
-            createQueue: [],
-            deleteQueue: []
+            createByPlayer: {},
+            updateByPlayer: {},
+            deleteByPlayer: {}
+        },
+
+        _ensureCreateGroup(gameID, playerID, playerColor) {
+            const pid = String(playerID);
+            if (!this.batchBuffers.createByPlayer[pid]) {
+                this.batchBuffers.createByPlayer[pid] = {
+                    gameID: Number(gameID),
+                    playerID: Number(playerID),
+                    playerColor: playerColor || '#FFFFFF',
+                    paths: []
+                };
+            }
+        },
+        _ensureUpdateGroup(gameID, playerID) {
+            const pid = String(playerID);
+            if (!this.batchBuffers.updateByPlayer[pid]) {
+                this.batchBuffers.updateByPlayer[pid] = {
+                    gameID: Number(gameID),
+                    playerID: Number(playerID),
+                    pathsById: {}
+                };
+            }
+        },
+        _ensureDeleteGroup(gameID, playerID) {
+            const pid = String(playerID);
+            if (!this.batchBuffers.deleteByPlayer[pid]) {
+                this.batchBuffers.deleteByPlayer[pid] = {
+                    gameID: Number(gameID),
+                    playerID: Number(playerID),
+                    pathIds: new Set()
+                };
+            }
+        },
+
+        _removeFromCreates(playerID, pathId) {
+            const pid = String(playerID);
+            const group = this.batchBuffers.createByPlayer[pid];
+            if (!group) return;
+            group.paths = group.paths.filter(p => String(p.id) !== String(pathId));
+        },
+
+        _removeFromUpdates(playerID, pathId) {
+            const pid = String(playerID);
+            const group = this.batchBuffers.updateByPlayer[pid];
+            if (!group) return;
+            delete group.pathsById[String(pathId)];
+        },
+
+        _removeFromDeletes(playerID, pathId) {
+            const pid = String(playerID);
+            const group = this.batchBuffers.deleteByPlayer[pid];
+            if (!group) return;
+            group.pathIds.delete(String(pathId));
         },
 
         /**
-         * Queue a path to be created next flush.
+         * queueCreatePath:
+         * Called when we finish a brand new stroke,
+         * or when we split a path and spawn a new half.
          */
         queueCreatePath(gameID, playerID, playerColor, pathObj) {
-            this.batchBuffers.createQueue.push({
-                gameID,
-                playerID,
-                playerColor,
-                pathObj
-            });
+            const pid = String(playerID);
+
+            this._removeFromDeletes(playerID, pathObj.id);
+            this._removeFromUpdates(playerID, pathObj.id);
+            this._ensureCreateGroup(gameID, playerID, playerColor);
+
+            const createGroup = this.batchBuffers.createByPlayer[pid];
+            // upsert into create list
+            const existingIdx = createGroup.paths.findIndex(
+                p => String(p.id) === String(pathObj.id)
+            );
+            const packed = {
+                id: String(pathObj.id),
+                points: pathObj.points.map(pt => ({ x: pt.x, y: pt.y }))
+            };
+
+            if (existingIdx >= 0) {
+                createGroup.paths[existingIdx] = packed;
+            } else {
+                createGroup.paths.push(packed);
+            }
         },
 
         /**
-         * Queue a deletion by pathUID for next flush.
+         * queueUpdatePath:
+         * Called when we partially erase a path and keep some of it.
+         * Keeps same path ID but fewer points.
+         */
+        queueUpdatePath(gameID, playerID, pathObj) {
+            const pid = String(playerID);
+
+            this._removeFromDeletes(playerID, pathObj.id);
+            const createGroup = this.batchBuffers.createByPlayer[pid];
+            if (createGroup) {
+                const idx = createGroup.paths.findIndex(
+                    p => String(p.id) === String(pathObj.id)
+                );
+                if (idx >= 0) {
+                    createGroup.paths[idx] = {
+                        id: String(pathObj.id),
+                        points: pathObj.points.map(pt => ({ x: pt.x, y: pt.y }))
+                    };
+                    return;
+                }
+            }
+
+            // Normal case: queue an update
+            this._ensureUpdateGroup(gameID, playerID);
+            const updateGroup = this.batchBuffers.updateByPlayer[pid];
+            updateGroup.pathsById[String(pathObj.id)] = {
+                id: String(pathObj.id),
+                points: pathObj.points.map(pt => ({ x: pt.x, y: pt.y }))
+            };
+        },
+
+        /**
+         * queueDeletePath:
+         * Called when we erase an entire path from our local view.
          */
         queueDeletePath(gameID, playerID, pathUID) {
-            this.batchBuffers.deleteQueue.push({
-                gameID,
-                playerID,
-                pathUID: String(pathUID)
-            });
+            const pid = String(playerID);
+
+            // If we had created this path in this batch and then deleted it,
+            // just cancel the create (don't bother telling backend).
+            this._removeFromCreates(playerID, pathUID);
+
+            // Also remove any pending updates for this path
+            this._removeFromUpdates(playerID, pathUID);
+
+            // Now mark it deleted
+            this._ensureDeleteGroup(gameID, playerID);
+            this.batchBuffers.deleteByPlayer[pid].pathIds.add(String(pathUID));
         },
 
         flushBatchesNow() {
@@ -60,104 +170,142 @@
                 return;
             }
 
-            const creates = this.batchBuffers.createQueue;
-            const deletes = this.batchBuffers.deleteQueue;
-            this.batchBuffers = { createQueue: [], deleteQueue: [] };
+            // snapshot and reset buffers
+            const creates = this.batchBuffers.createByPlayer;
+            const updates = this.batchBuffers.updateByPlayer;
+            const deletes = this.batchBuffers.deleteByPlayer;
 
-            for (const entry of creates) {
-                const gameID = Number(entry.gameID);
-                const playerID = Number(entry.playerID);
-                const playerColor = entry.playerColor || '#FFFFFF';
+            this.batchBuffers = {
+                createByPlayer: {},
+                updateByPlayer: {},
+                deleteByPlayer: {}
+            };
 
-                const backendPathModel = {
-                    id: 0,
-                    fk_GameID: 0,
-                    pathUID: String(entry.pathObj.id),
-                    points: entry.pathObj.points.map(pt => ({
-                        id: 0,
-                        fk_PathID: 0,
-                        x: pt.x,
-                        y: pt.y
-                    }))
-                };
+            // 1. send updates
+            for (const payload of Object.values(updates)) {
+                const pathArray = Object.values(payload.pathsById);
+                if (!pathArray.length) continue;
 
-                console.log('[SYNC] CreatePath -> backend', {
-                    gameID,
-                    playerID,
-                    playerColor,
-                    backendPathModel
-                });
+                for (const p of pathArray) {
+                    // Build what the backend expects
+                    const pathUID = String(p.id);
+                    const pointsList = p.points.map(pt => ({
+                        X: pt.x,
+                        Y: pt.y
+                    }));
 
-                this.connection.invoke(
-                    'CreatePath',
-                    gameID,
-                    playerID,
-                    playerColor,
-                    backendPathModel
-                ).catch(err => {
-                    console.error('[SYNC] CreatePath failed', err);
-                });
+                    console.log('[SYNC] UpdatePath -> backend (one path)', {
+                        gameID: payload.gameID,
+                        playerID: payload.playerID,
+                        pathUID: pathUID,
+                        points: pointsList
+                    });
+
+                    this.connection.invoke(
+                        'UpdatePath',
+                        payload.gameID,        // long gameID
+                        payload.playerID,      // int playerID
+                        pathUID,               // string pathUID
+                        pointsList             // List<PathPoint> newPoints
+                    )
+                        .catch(err => console.error('[SYNC] UpdatePath failed', err));
+                }
             }
 
-            // Send deletes one by one
-            for (const entry of deletes) {
-                const gameID = Number(entry.gameID);
-                const playerID = Number(entry.playerID);
-                const uid = entry.pathUID;
 
-                console.log('[SYNC] DeletePath -> backend', {
-                    gameID,
-                    playerID,
-                    uid
-                });
+            // 2. send creates
+            for (const payload of Object.values(creates)) {
+                if (!payload.paths || payload.paths.length === 0) continue;
 
-                this.connection.invoke(
-                    'DeletePath',
-                    gameID,
-                    playerID,
-                    uid
-                ).catch(err => {
-                    console.error('[SYNC] DeletePath failed', err);
-                });
+                for (const p of payload.paths) {
+                    const serverPath = {
+                        PathUID: String(p.id),
+                        Points: p.points.map(pt => ({
+                            X: pt.x,
+                            Y: pt.y
+                        }))
+                    };
+
+                    console.log('[SYNC] CreatePath -> backend (one path)', {
+                        gameID: payload.gameID,
+                        playerID: payload.playerID,
+                        playerColor: payload.playerColor,
+                        path: serverPath
+                    });
+
+                    this.connection.invoke(
+                        'CreatePath',
+                        payload.gameID,        // long gameID
+                        payload.playerID,      // int playerID
+                        payload.playerColor,   // string playerColor
+                        serverPath             // Models.Path
+                    )
+                        .catch(err => console.error('[SYNC] CreatePath failed', err));
+                }
             }
+
+            // 3. send deletes
+            for (const payload of Object.values(deletes)) {
+                const arrIds = Array.from(payload.pathIds);
+                if (!arrIds.length) continue;
+
+                for (const pathUID of arrIds) {
+                    console.log('[SYNC] DeletePath -> backend (one pathUID)', {
+                        gameID: payload.gameID,
+                        playerID: payload.playerID,
+                        pathUID: pathUID
+                    });
+
+                    this.connection.invoke(
+                        'DeletePath',
+                        payload.gameID,        // long gameID
+                        payload.playerID,      // int playerID
+                        String(pathUID)        // string pathUID
+                    )
+                        .catch(err => console.error('[SYNC] DeletePath failed', err));
+                }
+            }
+
         },
 
         /**
-        Transform database into useable data
+         * applyFullStateFromBackend:
+         * Takes the result of GetAll() and hydrates local state.
          */
         applyFullStateFromBackend(games) {
             if (!games || !state.game.gameID) return;
             const currentGameID = Number(state.game.gameID);
 
             const rebuilt = {};
-
             for (const game of games) {
-                if (Number(game.gameID) !== currentGameID) continue;
+                if (Number(game.gameID ?? game.GameID) !== currentGameID) continue;
 
-                const pID = Number(game.playerID);
-                const color = game.playerColor || '#FFFFFF';
+                const pID = Number(game.playerID ?? game.PlayerID);
+                const color =
+                    game.playerColor ??
+                    game.PlayerColor ??
+                    '#FFFFFF';
 
                 if (!rebuilt[pID]) {
-                    rebuilt[pID] = {
-                        color,
-                        paths: []
-                    };
+                    rebuilt[pID] = { color, paths: [] };
                 }
 
-                for (const path of game.paths || []) {
-                    const uid =
-                        path.pathUID ||
-                        path.PathUID ||
-                        path.pathUid ||
-                        path.id ||
-                        'unknown';
+                const pathsArr = game.paths ?? game.Paths ?? [];
+                for (const path of pathsArr) {
+                    const uid = String(
+                        path.pathUID ??
+                        path.PathUID ??
+                        path.id ??
+                        path.ID ??
+                        path.pathUid ??
+                        'unknown'
+                    );
 
-                    const pts = [];
-                    if (path.points) {
-                        for (const pt of path.points) {
-                            pts.push({ x: pt.x, y: pt.y });
-                        }
-                    }
+                    const ptsRaw = path.points ?? path.Points ?? [];
+                    const pts = ptsRaw.map(pt => ({
+                        x: (pt.x !== undefined ? pt.x : pt.X),
+                        y: (pt.y !== undefined ? pt.y : pt.Y)
+                    }));
 
                     rebuilt[pID].paths.push({
                         id: uid,
@@ -176,9 +324,6 @@
             rebuildPlayersIfChanged();
         },
 
-        /**
-         * Ask server for full state now (used after connect).
-         */
         requestFullStateOnce() {
             if (!this.ready) {
                 this._pendingInvokes.push(() => this.requestFullStateOnce());
@@ -190,13 +335,13 @@
                     console.log('[SYNC] Initial GetAll <- backend', games);
                     this.applyFullStateFromBackend(games);
                 })
-                .catch(err => {
-                    console.error('[SYNC] GetAll failed', err);
-                });
+                .catch(err => console.error('[SYNC] GetAll failed', err));
         }
     };
 
-    // Load SignalR client lib, then connect and wire handlers
+    /*****************************************************************
+     * SIGNALR CONNECTION
+     *****************************************************************/
     function ensureSignalRConnection() {
         if (backend.connection) return;
 
@@ -208,20 +353,16 @@
             console.log('[SYNC] SignalR client loaded, connecting...');
 
             backend.connection = new window.signalR.HubConnectionBuilder()
-                .withUrl(CONFIG.HUB_URL, {
-                    withCredentials: false
-                })
+                .withUrl(CONFIG.HUB_URL, { withCredentials: false })
                 .withAutomaticReconnect()
                 .build();
 
-            //    await Clients.All.SendAsync("FullStateSync", gamesList);
             backend.connection.on('FullStateSync', (games) => {
                 console.log('[SYNC] FullStateSync <- backend', games);
                 backend.applyFullStateFromBackend(games);
             });
 
-            backend.connection
-                .start()
+            backend.connection.start()
                 .then(() => {
                     backend.ready = true;
                     console.log('[SYNC] Connected to hub', CONFIG.HUB_URL);
@@ -234,22 +375,16 @@
 
                     backend.requestFullStateOnce();
                 })
-                .catch(err => {
-                    console.error('[SYNC] hub start failed', err);
-                });
+                .catch(err => console.error('[SYNC] hub start failed', err));
         };
 
-        script.onerror = () => {
-            console.error('[SYNC] Failed to load SignalR client library');
-        };
-
+        script.onerror = () => console.error('[SYNC] Failed to load SignalR client library');
         document.head.appendChild(script);
     }
 
     /*****************************************************************
      * 2. UI CREATION
      *****************************************************************/
-
     const ui = document.createElement('div');
     ui.style.cssText = 'position:fixed;top:12px;left:12px;z-index:2147483647;display:flex;flex-direction:column;gap:6px;align-items:flex-start;background:rgba(0,0,0,.6);color:#fff;padding:8px 10px;border-radius:8px;font:12px/1.2 system-ui,ui-sans-serif;backdrop-filter:blur(4px)';
     document.body.appendChild(ui);
@@ -336,6 +471,7 @@
 
     uiContent.appendChild(controls);
 
+    // Overlay canvas
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     canvas.style.cssText = 'position: fixed; top: 0; left: 0; z-index: 2147483646; pointer-events: none;';
@@ -355,11 +491,7 @@
         attached: false,
         hupWin: null,
         hupPath: '',
-        game: {
-            playerID: null,
-            gameID: null,
-            playerColor: '#FF0000'
-        },
+        game: { playerID: null, gameID: null, playerColor: '#FF0000' },
         allDrawings: {},
         drawing: {
             isDrawing: false,
@@ -374,9 +506,7 @@
         },
         _lastPlayerKeys: '',
         uiCollapsed: true,
-        batch: {
-            timerId: null
-        }
+        batch: { timerId: null }
     };
 
     /*****************************************************************
@@ -394,18 +524,11 @@
 
     function framesSameOrigin() {
         const list = [];
-        try {
-            if (window && window.document) {
-                list.push({ win: window, tag: 'top' });
-            }
-        } catch { }
+        try { if (window && window.document) list.push({ win: window, tag: 'top' }); } catch { }
         try {
             for (let i = 0; i < window.frames.length; i++) {
                 const w = window.frames[i];
-                try {
-                    void w.document;
-                    list.push({ win: w, tag: 'frames[' + i + ']' });
-                } catch { }
+                try { void w.document; list.push({ win: w, tag: 'frames[' + i + ']' }); } catch { }
             }
         } catch { }
         try {
@@ -443,35 +566,28 @@
                     state.hupWin = c.win;
                     state.hupPath = p;
                     initializeGameData(c.win);
-
-                    // once we know player/game, open the SignalR connection
                     ensureSignalRConnection();
-
                     return true;
                 }
             }
         }
         if (state.hupWin) removeDrawingListeners(state.hupWin);
         state.attached = false;
-        hupWin = null;
-        hupPath = '';
+        state.hupWin = null;
+        state.hupPath = '';
         return false;
     }
 
-    const boot = setInterval(() => {
-        if (attach()) clearInterval(boot);
-    }, 300);
+    const boot = setInterval(() => { if (attach()) clearInterval(boot); }, 300);
 
     function initializeGameData(win) {
         const gameState = tryGet(win, 'hup.gameState');
         if (!gameState) return;
-
         const playerProfile = gameState.getPlayerProfile();
         if (playerProfile) {
             state.game.playerID = playerProfile.playerID;
             state.game.playerColor = playerProfile.primaryColor;
         }
-
         const gameServer = tryGet(win, 'hup.gameServer');
         if (gameServer && gameServer.gameID) {
             state.game.gameID = gameServer.gameID;
@@ -489,18 +605,16 @@
     }
 
     /*****************************************************************
-     * 5. UI BUTTON HANDLERS
+     * 5. UI HANDLERS
      *****************************************************************/
     clearButton.addEventListener('click', () => {
         const pid = state.game.playerID;
         const gid = state.game.gameID;
         if (pid && state.allDrawings[pid]) {
             const myData = state.allDrawings[pid];
-
             for (const p of myData.paths) {
                 backend.queueDeletePath(gid, pid, p.id);
             }
-
             myData.paths = [];
             markDirtyAndScheduleBatch();
         }
@@ -593,7 +707,6 @@
     /*****************************************************************
      * 6. DRAW / ERASE + BATCHING
      *****************************************************************/
-
     function getTransformedCoords(screenX, screenY) {
         const vp = state.drawing.viewport;
         if (!vp) return null;
@@ -604,6 +717,7 @@
         };
     }
 
+    // Erasing logic: decides whether to delete, shrink, or split paths
     function erasePathsNear(coords) {
         if (!coords || !state.drawing.viewport || !state.game.playerID) return;
         const myDrawings = state.allDrawings[state.game.playerID];
@@ -616,65 +730,101 @@
 
         for (let i = myDrawings.paths.length - 1; i >= 0; i--) {
             const path = myDrawings.paths[i];
+            let hitIndex = -1;
+
             for (let j = 0; j < path.points.length; j++) {
                 const point = path.points[j];
                 const dx = point.x - coords.x;
                 const dy = point.y - coords.y;
                 if (dx * dx + dy * dy < eraseRadiusSq) {
-                    const halfChunk = Math.floor(ERASE_CHUNK_SIZE / 2);
-                    const startIndex = Math.max(0, j - halfChunk);
-                    const endIndex = Math.min(path.points.length, j + halfChunk);
-
-                    const pointsBefore = path.points.slice(0, startIndex);
-                    const pointsAfter = path.points.slice(endIndex);
-
-                    myDrawings.paths.splice(i, 1);
-                    backend.queueDeletePath(
-                        state.game.gameID,
-                        state.game.playerID,
-                        path.id
-                    );
-
-                    if (pointsBefore.length > 1) {
-                        const newPathBefore = {
-                            id: generateUniqueId(),
-                            points: pointsBefore,
-                            sent: false,
-                            isFinal: true
-                        };
-                        myDrawings.paths.push(newPathBefore);
-
-                        backend.queueCreatePath(
-                            state.game.gameID,
-                            state.game.playerID,
-                            myDrawings.color,
-                            newPathBefore
-                        );
-                        newPathBefore.sent = true;
-                    }
-
-                    if (pointsAfter.length > 1) {
-                        const newPathAfter = {
-                            id: generateUniqueId(),
-                            points: pointsAfter,
-                            sent: false,
-                            isFinal: true
-                        };
-                        myDrawings.paths.push(newPathAfter);
-
-                        backend.queueCreatePath(
-                            state.game.gameID,
-                            state.game.playerID,
-                            myDrawings.color,
-                            newPathAfter
-                        );
-                        newPathAfter.sent = true;
-                    }
-
-                    markDirtyAndScheduleBatch();
-                    return;
+                    hitIndex = j;
+                    break;
                 }
             }
+
+            if (hitIndex === -1) continue;
+
+            // slice out a chunk around the hit point
+            const halfChunk = Math.floor(ERASE_CHUNK_SIZE / 2);
+            const startIndex = Math.max(0, hitIndex - halfChunk);
+            const endIndex = Math.min(path.points.length, hitIndex + halfChunk);
+
+            const pointsBefore = path.points.slice(0, startIndex);
+            const pointsAfter = path.points.slice(endIndex);
+
+            const keepBefore = pointsBefore.length > 1;
+            const keepAfter = pointsAfter.length > 1;
+
+            // CASE A: nothing left -> delete whole path
+            if (!keepBefore && !keepAfter) {
+                myDrawings.paths.splice(i, 1);
+
+                backend.queueDeletePath(
+                    state.game.gameID,
+                    state.game.playerID,
+                    path.id
+                );
+
+                markDirtyAndScheduleBatch();
+                return;
+            }
+
+            // CASE B: exactly one remaining segment -> shrink original path
+            if (keepBefore ^ keepAfter) {
+                const remaining = keepBefore ? pointsBefore : pointsAfter;
+
+                path.points = remaining.slice();
+                path.isFinal = true;
+                path.sent = false;
+
+                backend.queueUpdatePath(
+                    state.game.gameID,
+                    state.game.playerID,
+                    { id: path.id, points: remaining }
+                );
+                path.sent = true;
+
+                markDirtyAndScheduleBatch();
+                return;
+            }
+
+            // CASE C: both segments remain -> keep longer part in original, create new path with shorter part
+            const lenBefore = pointsBefore.length;
+            const lenAfter = pointsAfter.length;
+            const keepOnOriginal = lenBefore >= lenAfter ? pointsBefore : pointsAfter;
+            const spawnAsNew = lenBefore >= lenAfter ? pointsAfter : pointsBefore;
+
+            // update original with the longer portion
+            path.points = keepOnOriginal.slice();
+            path.isFinal = true;
+            path.sent = false;
+
+            backend.queueUpdatePath(
+                state.game.gameID,
+                state.game.playerID,
+                { id: path.id, points: keepOnOriginal }
+            );
+            path.sent = true;
+
+            // create a brand new path from the other portion
+            const newPath = {
+                id: generateUniqueId(),
+                points: spawnAsNew.slice(),
+                sent: false,
+                isFinal: true
+            };
+            myDrawings.paths.push(newPath);
+
+            backend.queueCreatePath(
+                state.game.gameID,
+                state.game.playerID,
+                myDrawings.color,
+                newPath
+            );
+            newPath.sent = true;
+
+            markDirtyAndScheduleBatch();
+            return;
         }
     }
 
@@ -808,10 +958,12 @@
     /*****************************************************************
      * 7. RENDERING
      *****************************************************************/
-
     function drawGrid(viewport) {
         const { totalWidth, totalHeight, _scale: scale } = viewport;
         const gridSize = 100;
+
+        const prevStroke = ctx.strokeStyle;
+        const prevWidth = ctx.lineWidth;
 
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
         ctx.lineWidth = 1 / scale;
@@ -828,6 +980,9 @@
         }
 
         ctx.stroke();
+
+        ctx.strokeStyle = prevStroke;
+        ctx.lineWidth = prevWidth;
     }
 
     function drawSinglePath(points, color, scale) {
@@ -840,17 +995,20 @@
         }
 
         ctx.strokeStyle = color;
+        ctx.lineWidth = ctx.lineWidth; // explicit
         ctx.stroke();
     }
 
     function updateCanvas(viewport) {
         const scale = viewport._scale;
 
+        // clear the canvas in screen space
         ctx.save();
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.restore();
 
+        // move into "world space"
         ctx.save();
         ctx.scale(scale, scale);
         ctx.translate(-viewport.rect.x, -viewport.rect.y);
@@ -878,6 +1036,7 @@
         ctx.restore();
     }
 
+    // Default UI collapsed
     uiContent.style.display = 'none';
     playersPanel.style.display = 'none';
     collapseBtn.textContent = '⯈';

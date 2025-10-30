@@ -1,20 +1,261 @@
 // ==UserScript==
-// @name         S1914 Map Drawing Overlay (Path IDs)
-// @namespace    1914.cam-hud.drawing.path-ids
-// @version      1.15.1
-// @description  Map drawing overlay with unique IDs for each path for robust API syncing, per-player visibility controls, collapsible HUD, and deferred incremental batch logging.
+// @name         S1914 Map Drawing Overlay (Synced via SignalR, Batched)
+// @namespace    mr-cool.s1914.cam-hud.drawing.synced
+// @version      3.1.0
+// @description  Map drawing overlay with IDs, per-player visibility, batched create/delete to backend, and server-push sync
 // @match        https://www.supremacy1914.com/*
 // @grant        none
 // @noframes
 // ==/UserScript==
 
 (function () {
-    // tweakable knobs
+    /*****************************************************************
+     * 0. CONFIG
+     *****************************************************************/
     const CONFIG = {
-        BATCH_WAIT_SECONDS: 5 // how long after you stop drawing before batching/logging that data
+        BATCH_WAIT_SECONDS: 5, // how long after you stop drawing/erasing before we send batch
+        HUB_URL: 'https://powerboys.noxiaz.dk:5006/drawingHub' // backend SignalR hub
     };
 
-    // UI root and header (collapsible HUD shell)
+    /*****************************************************************
+     * 1. BACKEND / SIGNALR
+     *****************************************************************/
+
+    const backend = {
+        connection: null,
+        ready: false,
+        _pendingInvokes: [],
+
+        // We accumulate stuff to send on the next flush.
+        // Each entry in createQueue:
+        //   { gameID, playerID, playerColor, pathObj }
+        // Each entry in deleteQueue:
+        //   { gameID, playerID, pathUID }
+        batchBuffers: {
+            createQueue: [],
+            deleteQueue: []
+        },
+
+        /**
+         * Queue a path to be created next flush.
+         * pathObj = { id, points:[{x,y},...], sent?, isFinal? }
+         */
+        queueCreatePath(gameID, playerID, playerColor, pathObj) {
+            this.batchBuffers.createQueue.push({
+                gameID,
+                playerID,
+                playerColor,
+                pathObj
+            });
+        },
+
+        /**
+         * Queue a deletion by pathUID for next flush.
+         */
+        queueDeletePath(gameID, playerID, pathUID) {
+            this.batchBuffers.deleteQueue.push({
+                gameID,
+                playerID,
+                pathUID: String(pathUID)
+            });
+        },
+
+        flushBatchesNow() {
+            if (!this.ready) {
+                this._pendingInvokes.push(() => this.flushBatchesNow());
+                return;
+            }
+
+            const creates = this.batchBuffers.createQueue;
+            const deletes = this.batchBuffers.deleteQueue;
+            this.batchBuffers = { createQueue: [], deleteQueue: [] };
+
+            for (const entry of creates) {
+                const gameID = Number(entry.gameID);
+                const playerID = Number(entry.playerID);
+                const playerColor = entry.playerColor || '#FFFFFF';
+
+                const backendPathModel = {
+                    id: 0,
+                    fk_GameID: 0,
+                    pathUID: String(entry.pathObj.id),
+                    points: entry.pathObj.points.map(pt => ({
+                        id: 0,
+                        fk_PathID: 0,
+                        x: pt.x,
+                        y: pt.y
+                    }))
+                };
+
+                console.log('[SYNC] CreatePath -> backend', {
+                    gameID,
+                    playerID,
+                    playerColor,
+                    backendPathModel
+                });
+
+                this.connection.invoke(
+                    'CreatePath',
+                    gameID,
+                    playerID,
+                    playerColor,
+                    backendPathModel
+                ).catch(err => {
+                    console.error('[SYNC] CreatePath failed', err);
+                });
+            }
+
+            // Send deletes one by one
+            for (const entry of deletes) {
+                const gameID = Number(entry.gameID);
+                const playerID = Number(entry.playerID);
+                const uid = entry.pathUID;
+
+                console.log('[SYNC] DeletePath -> backend', {
+                    gameID,
+                    playerID,
+                    uid
+                });
+
+                this.connection.invoke(
+                    'DeletePath',
+                    gameID,
+                    playerID,
+                    uid
+                ).catch(err => {
+                    console.error('[SYNC] DeletePath failed', err);
+                });
+            }
+        },
+
+        /**
+        Transform database into useable data
+         */
+        applyFullStateFromBackend(games) {
+            if (!games || !state.game.gameID) return;
+            const currentGameID = Number(state.game.gameID);
+
+            const rebuilt = {};
+
+            for (const game of games) {
+                if (Number(game.gameID) !== currentGameID) continue;
+
+                const pID = Number(game.playerID);
+                const color = game.playerColor || '#FFFFFF';
+
+                if (!rebuilt[pID]) {
+                    rebuilt[pID] = {
+                        color,
+                        paths: []
+                    };
+                }
+
+                for (const path of game.paths || []) {
+                    const uid =
+                        path.pathUID ||
+                        path.PathUID ||
+                        path.pathUid ||
+                        path.id ||
+                        'unknown';
+
+                    const pts = [];
+                    if (path.points) {
+                        for (const pt of path.points) {
+                            pts.push({ x: pt.x, y: pt.y });
+                        }
+                    }
+
+                    rebuilt[pID].paths.push({
+                        id: uid,
+                        points: pts,
+                        sent: true,
+                        isFinal: true
+                    });
+                }
+            }
+
+            for (const [playerID, pdata] of Object.entries(rebuilt)) {
+                state.allDrawings[playerID] = pdata;
+                ensureVisibilityEntry(playerID);
+            }
+
+            rebuildPlayersIfChanged();
+        },
+
+        /**
+         * Ask server for full state now (used after connect).
+         */
+        requestFullStateOnce() {
+            if (!this.ready) {
+                this._pendingInvokes.push(() => this.requestFullStateOnce());
+                return;
+            }
+
+            this.connection.invoke('GetAll')
+                .then(games => {
+                    console.log('[SYNC] Initial GetAll <- backend', games);
+                    this.applyFullStateFromBackend(games);
+                })
+                .catch(err => {
+                    console.error('[SYNC] GetAll failed', err);
+                });
+        }
+    };
+
+    // Load SignalR client lib, then connect and wire handlers
+    function ensureSignalRConnection() {
+        if (backend.connection) return;
+
+        const script = document.createElement('script');
+        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.0/signalr.min.js';
+        script.crossOrigin = 'anonymous';
+
+        script.onload = () => {
+            console.log('[SYNC] SignalR client loaded, connecting...');
+
+            backend.connection = new window.signalR.HubConnectionBuilder()
+                .withUrl(CONFIG.HUB_URL, {
+                    withCredentials: false
+                })
+                .withAutomaticReconnect()
+                .build();
+
+            //    await Clients.All.SendAsync("FullStateSync", gamesList);
+            backend.connection.on('FullStateSync', (games) => {
+                console.log('[SYNC] FullStateSync <- backend', games);
+                backend.applyFullStateFromBackend(games);
+            });
+
+            backend.connection
+                .start()
+                .then(() => {
+                    backend.ready = true;
+                    console.log('[SYNC] Connected to hub', CONFIG.HUB_URL);
+
+                    const pending = backend._pendingInvokes.slice();
+                    backend._pendingInvokes.length = 0;
+                    for (const fn of pending) {
+                        try { fn(); } catch (e) { console.error('[SYNC] pending invoke err', e); }
+                    }
+
+                    backend.requestFullStateOnce();
+                })
+                .catch(err => {
+                    console.error('[SYNC] hub start failed', err);
+                });
+        };
+
+        script.onerror = () => {
+            console.error('[SYNC] Failed to load SignalR client library');
+        };
+
+        document.head.appendChild(script);
+    }
+
+    /*****************************************************************
+     * 2. UI CREATION
+     *****************************************************************/
+
     const ui = document.createElement('div');
     ui.style.cssText = 'position:fixed;top:12px;left:12px;z-index:2147483647;display:flex;flex-direction:column;gap:6px;align-items:flex-start;background:rgba(0,0,0,.6);color:#fff;padding:8px 10px;border-radius:8px;font:12px/1.2 system-ui,ui-sans-serif;backdrop-filter:blur(4px)';
     document.body.appendChild(ui);
@@ -34,12 +275,10 @@
 
     ui.appendChild(uiHeader);
 
-    // HUD content (buttons, player filters, etc.)
     const uiContent = document.createElement('div');
     uiContent.style.cssText = 'display:flex;flex-wrap:wrap;row-gap:8px;column-gap:8px;align-items:center;';
     ui.appendChild(uiContent);
 
-    // Buttons group (draw hints, grid toggle, clear, players dropdown)
     const controls = document.createElement('div');
     controls.style.cssText = 'display:contents; border-left: 1px solid rgba(255,255,255,.2); margin-left: 6px; padding-left: 8px;';
 
@@ -70,7 +309,6 @@
     const apiControls = document.createElement('div');
     apiControls.style.cssText = 'display:contents; border-left: 1px solid rgba(255,255,255,.2); margin-left: 6px; padding-left: 8px;';
 
-    // Player visibility controls (dropdown with per-player toggles + hide all)
     const playersWrap = document.createElement('div');
     playersWrap.style.cssText = 'position:relative; display:inline-flex; align-items:center; gap:6px; margin-left:8px;';
 
@@ -87,8 +325,8 @@
 
     const playersList = document.createElement('div');
     playersList.style.cssText = 'display:flex; flex-direction:column; gap:6px;';
-
     playersPanel.appendChild(playersList);
+
     playersWrap.append(playersBtn, hideAllBtn, playersPanel);
 
     controls.append(
@@ -104,13 +342,11 @@
 
     uiContent.appendChild(controls);
 
-    // The drawing canvas overlay that sits over the game
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     canvas.style.cssText = 'position: fixed; top: 0; left: 0; z-index: 2147483646; pointer-events: none;';
     document.body.appendChild(canvas);
 
-    // Keep canvas in sync with window size
     function resizeCanvas() {
         canvas.width = window.innerWidth;
         canvas.height = window.innerHeight;
@@ -118,12 +354,18 @@
     window.addEventListener('resize', resizeCanvas);
     resizeCanvas();
 
-    // Global runtime state (game info, drawings, filters, batching)
+    /*****************************************************************
+     * 3. STATE
+     *****************************************************************/
     const state = {
         attached: false,
         hupWin: null,
         hupPath: '',
-        game: { playerID: null, gameID: null, playerColor: '#FF0000' },
+        game: {
+            playerID: null,
+            gameID: null,
+            playerColor: '#FF0000'
+        },
         allDrawings: {},
         drawing: {
             isDrawing: false,
@@ -132,7 +374,10 @@
             viewport: null,
             showGrid: false
         },
-        filters: { hideAll: false, hiddenPlayers: {} },
+        filters: {
+            hideAll: false,
+            hiddenPlayers: {}
+        },
         _lastPlayerKeys: '',
         uiCollapsed: true,
         batch: {
@@ -140,26 +385,33 @@
         }
     };
 
-    // Safe nested object access
+    /*****************************************************************
+     * 4. HELPERS
+     *****************************************************************/
     function tryGet(obj, path) {
         try { return path.split('.').reduce((o, k) => o && o[k], obj) ?? null; } catch { return null; }
     }
 
-    // Create a numeric-ish ID for each drawn path
     function generateUniqueId() {
         const timestamp = Date.now();
         const randomPart = Math.floor(Math.random() * 1_000);
         return timestamp * 1_000 + randomPart;
     }
 
-    // Collect all same-origin frames (top window + iframes) so we can find the game viewport
     function framesSameOrigin() {
         const list = [];
-        try { if (window && window.document) list.push({ win: window, tag: 'top' }); } catch { }
+        try {
+            if (window && window.document) {
+                list.push({ win: window, tag: 'top' });
+            }
+        } catch { }
         try {
             for (let i = 0; i < window.frames.length; i++) {
                 const w = window.frames[i];
-                try { void w.document; list.push({ win: w, tag: 'frames[' + i + ']' }); } catch { }
+                try {
+                    void w.document;
+                    list.push({ win: w, tag: 'frames[' + i + ']' });
+                } catch { }
             }
         } catch { }
         try {
@@ -176,7 +428,6 @@
         return list;
     }
 
-    // Possible viewport locations inside the game client
     const viewportPaths = [
         'hup.mapMouseController.viewport',
         'hup.lasso.viewport',
@@ -184,7 +435,6 @@
         'hup.gameController.view.viewport'
     ];
 
-    // Tries to hook into the running game: finds viewport, attaches listeners
     function attach() {
         const cands = framesSameOrigin();
         for (const c of cands) {
@@ -199,6 +449,10 @@
                     state.hupWin = c.win;
                     state.hupPath = p;
                     initializeGameData(c.win);
+
+                    // once we know player/game, open the SignalR connection
+                    ensureSignalRConnection();
+
                     return true;
                 }
             }
@@ -210,53 +464,74 @@
         return false;
     }
 
-    // Keeps trying to connect until we succeed once
-    const boot = setInterval(() => { if (attach()) clearInterval(boot); }, 300);
+    const boot = setInterval(() => {
+        if (attach()) clearInterval(boot);
+    }, 300);
 
-    // Pulls basic game/player info from the client (playerID, color, gameID)
     function initializeGameData(win) {
         const gameState = tryGet(win, 'hup.gameState');
         if (!gameState) return;
+
         const playerProfile = gameState.getPlayerProfile();
         if (playerProfile) {
             state.game.playerID = playerProfile.playerID;
             state.game.playerColor = playerProfile.primaryColor;
         }
+
         const gameServer = tryGet(win, 'hup.gameServer');
-        if (gameServer && gameServer.gameID) state.game.gameID = gameServer.gameID;
-        if (state.game.playerID && !state.allDrawings[state.game.playerID]) {
-            state.allDrawings[state.game.playerID] = { color: state.game.playerColor, paths: [] };
+        if (gameServer && gameServer.gameID) {
+            state.game.gameID = gameServer.gameID;
         }
+
+        if (state.game.playerID && !state.allDrawings[state.game.playerID]) {
+            state.allDrawings[state.game.playerID] = {
+                color: state.game.playerColor,
+                paths: []
+            };
+        }
+
         ensureVisibilityEntry(state.game.playerID);
         rebuildPlayersIfChanged();
     }
 
-    // "Clear My Drawings" button handler
+    /*****************************************************************
+     * 5. UI BUTTON HANDLERS
+     *****************************************************************/
     clearButton.addEventListener('click', () => {
-        if (state.game.playerID && state.allDrawings[state.game.playerID]) {
-            state.allDrawings[state.game.playerID].paths = [];
+        const pid = state.game.playerID;
+        const gid = state.game.gameID;
+        if (pid && state.allDrawings[pid]) {
+            const myData = state.allDrawings[pid];
+
+            for (const p of myData.paths) {
+                backend.queueDeletePath(gid, pid, p.id);
+            }
+
+            myData.paths = [];
+            markDirtyAndScheduleBatch();
         }
     });
 
-    // Grid toggle button handler
     gridButton.addEventListener('click', () => {
         state.drawing.showGrid = !state.drawing.showGrid;
         gridButton.textContent = state.drawing.showGrid ? 'Grid: On' : 'Grid: Off';
-        gridButton.style.background = state.drawing.showGrid ? 'rgba(80,120,255,.3)' : 'rgba(255,255,255,.1)';
+        gridButton.style.background = state.drawing.showGrid
+            ? 'rgba(80,120,255,.3)'
+            : 'rgba(255,255,255,.1)';
     });
 
-    // Players dropdown toggle
     playersBtn.addEventListener('click', () => {
-        playersPanel.style.display = playersPanel.style.display === 'none' ? 'block' : 'none';
+        playersPanel.style.display =
+            playersPanel.style.display === 'none' ? 'block' : 'none';
     });
 
-    // Global "hide all drawings" toggle
     hideAllBtn.addEventListener('click', () => {
         state.filters.hideAll = !state.filters.hideAll;
-        hideAllBtn.textContent = state.filters.hideAll ? 'Hide All: On' : 'Hide All: Off';
+        hideAllBtn.textContent = state.filters.hideAll
+            ? 'Hide All: On'
+            : 'Hide All: Off';
     });
 
-    // Expand/collapse the HUD
     collapseBtn.addEventListener('click', () => {
         state.uiCollapsed = !state.uiCollapsed;
         if (state.uiCollapsed) {
@@ -269,44 +544,50 @@
         }
     });
 
-    // Ensures a player exists in the visibility map
     function ensureVisibilityEntry(playerID) {
         if (playerID == null) return;
-        if (!(playerID in state.filters.hiddenPlayers)) state.filters.hiddenPlayers[playerID] = false;
+        if (!(playerID in state.filters.hiddenPlayers)) {
+            state.filters.hiddenPlayers[playerID] = false;
+        }
     }
 
-    // Builds one row in the players dropdown (color dot, checkbox, player ID)
     function playerItemRow(playerID, color) {
         const row = document.createElement('label');
         row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,.04)';
         const sw = document.createElement('span');
         sw.style.cssText = 'width:12px;height:12px;border-radius:50%;display:inline-block;border:1px solid rgba(255,255,255,.4)';
         sw.style.background = color || '#888';
+
         const cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.checked = !state.filters.hiddenPlayers[playerID];
         cb.addEventListener('change', () => {
             state.filters.hiddenPlayers[playerID] = !cb.checked;
         });
+
         const name = document.createElement('span');
         name.textContent = `#${playerID}`;
         name.style.cssText = 'color:#e6f0ff';
+
         row.append(sw, cb, name);
         return row;
     }
 
-    // Updates the players dropdown if the set of players changed
     function rebuildPlayersIfChanged() {
-        const keys = Object.keys(state.allDrawings).sort((a, b) => Number(a) - Number(b));
+        const keys = Object.keys(state.allDrawings).sort(
+            (a, b) => Number(a) - Number(b)
+        );
         const sig = keys.join(',');
         if (sig === state._lastPlayerKeys) return;
         state._lastPlayerKeys = sig;
+
         playersList.textContent = '';
         for (const k of keys) {
             ensureVisibilityEntry(k);
             const item = playerItemRow(k, state.allDrawings[k]?.color);
             playersList.appendChild(item);
         }
+
         if (keys.length === 0) {
             const empty = document.createElement('div');
             empty.textContent = 'No players yet';
@@ -315,23 +596,30 @@
         }
     }
 
-    // Converts screen coords (mouse) to world coords (map space)
+    /*****************************************************************
+     * 6. DRAW / ERASE + BATCHING
+     *****************************************************************/
+
     function getTransformedCoords(screenX, screenY) {
         const vp = state.drawing.viewport;
         if (!vp) return null;
         const scale = typeof vp._scale === 'number' ? vp._scale : 1;
-        return { x: screenX / scale + vp.rect.x, y: screenY / scale + vp.rect.y };
+        return {
+            x: screenX / scale + vp.rect.x,
+            y: screenY / scale + vp.rect.y
+        };
     }
 
-    // Removes nearby stroke segments from your own drawings (Alt+RClick erase)
     function erasePathsNear(coords) {
         if (!coords || !state.drawing.viewport || !state.game.playerID) return;
         const myDrawings = state.allDrawings[state.game.playerID];
         if (!myDrawings) return;
+
         const scale = state.drawing.viewport._scale;
         const eraseRadius = 15 / scale;
         const eraseRadiusSq = eraseRadius * eraseRadius;
         const ERASE_CHUNK_SIZE = 20;
+
         for (let i = myDrawings.paths.length - 1; i >= 0; i--) {
             const path = myDrawings.paths[i];
             for (let j = 0; j < path.points.length; j++) {
@@ -342,90 +630,100 @@
                     const halfChunk = Math.floor(ERASE_CHUNK_SIZE / 2);
                     const startIndex = Math.max(0, j - halfChunk);
                     const endIndex = Math.min(path.points.length, j + halfChunk);
+
                     const pointsBefore = path.points.slice(0, startIndex);
                     const pointsAfter = path.points.slice(endIndex);
+
                     myDrawings.paths.splice(i, 1);
+                    backend.queueDeletePath(
+                        state.game.gameID,
+                        state.game.playerID,
+                        path.id
+                    );
+
                     if (pointsBefore.length > 1) {
-                        myDrawings.paths.push({
+                        const newPathBefore = {
                             id: generateUniqueId(),
                             points: pointsBefore,
                             sent: false,
                             isFinal: true
-                        });
+                        };
+                        myDrawings.paths.push(newPathBefore);
+
+                        backend.queueCreatePath(
+                            state.game.gameID,
+                            state.game.playerID,
+                            myDrawings.color,
+                            newPathBefore
+                        );
+                        newPathBefore.sent = true;
                     }
+
                     if (pointsAfter.length > 1) {
-                        myDrawings.paths.push({
+                        const newPathAfter = {
                             id: generateUniqueId(),
                             points: pointsAfter,
                             sent: false,
                             isFinal: true
-                        });
+                        };
+                        myDrawings.paths.push(newPathAfter);
+
+                        backend.queueCreatePath(
+                            state.game.gameID,
+                            state.game.playerID,
+                            myDrawings.color,
+                            newPathAfter
+                        );
+                        newPathAfter.sent = true;
                     }
+
+                    markDirtyAndScheduleBatch();
                     return;
                 }
             }
         }
     }
 
-    // After you finish drawing, starts the "send in X seconds" timer
     function markDirtyAndScheduleBatch() {
         if (state.batch.timerId !== null) return;
         state.batch.timerId = window.setTimeout(() => {
-            flushBatchToConsole();
+            flushBatchToBackend();
             state.batch.timerId = null;
         }, CONFIG.BATCH_WAIT_SECONDS * 1000);
     }
 
-    // Builds a batch of only new, finished paths and logs it out
-    function flushBatchToConsole() {
-        if (!state.game.gameID || !state.game.playerID) return;
-
-        const playersPayload = [];
+    function flushBatchToBackend() {
+        const gid = state.game.gameID;
+        if (!gid) return;
 
         for (const [playerID, pdata] of Object.entries(state.allDrawings)) {
-            const unsentFinishedPaths = pdata.paths.filter(p => p.sent !== true && p.isFinal === true);
-
-            if (unsentFinishedPaths.length === 0) continue;
-
-            playersPayload.push({
-                playerID: Number(playerID),
-                playerColor: pdata.color,
-                paths: unsentFinishedPaths.map(p => ({
-                    id: p.id,
-                    points: p.points
-                }))
-            });
-
-            for (const p of unsentFinishedPaths) {
-                p.sent = true;
+            for (const p of pdata.paths) {
+                if (p.sent !== true && p.isFinal === true) {
+                    backend.queueCreatePath(
+                        gid,
+                        playerID,
+                        pdata.color,
+                        p
+                    );
+                    p.sent = true;
+                }
             }
         }
 
-        if (playersPayload.length === 0) {
-            return;
-        }
-
-        const payload = {
-            gameID: state.game.gameID,
-            players: playersPayload
-        };
-
-        console.log("--- BATCH SEND ---");
-        console.log(JSON.stringify(payload, null, 2));
+        backend.flushBatchesNow();
     }
 
-    // Handles Alt+mousedown:
-    // - LMB: begin new stroke and start collecting points
-    // - RMB: enter erase mode
     function handleMouseDown(e) {
         if (!state.attached || !e.altKey || !state.game.playerID) return;
 
         if (e.button === 2) {
-            e.stopPropagation(); e.preventDefault();
+            e.stopPropagation();
+            e.preventDefault();
             state.drawing.isErasing = true;
             erasePathsNear(getTransformedCoords(e.clientX, e.clientY));
         } else if (e.button === 0) {
-            e.stopPropagation(); e.preventDefault();
+            e.stopPropagation();
+            e.preventDefault();
             state.drawing.isDrawing = true;
 
             const coords = getTransformedCoords(e.clientX, e.clientY);
@@ -444,7 +742,9 @@
                     };
                 }
 
-                state.allDrawings[state.game.playerID].paths.push(state.drawing.currentPath);
+                state.allDrawings[state.game.playerID].paths.push(
+                    state.drawing.currentPath
+                );
 
                 ensureVisibilityEntry(state.game.playerID);
                 rebuildPlayersIfChanged();
@@ -452,17 +752,16 @@
         }
     }
 
-    // Handles Alt+mousemove:
-    // - while drawing, keep adding new points
-    // - while erasing, keep carving
     function handleMouseMove(e) {
         if (!e.altKey) return;
 
         if (state.drawing.isErasing) {
-            e.stopPropagation(); e.preventDefault();
+            e.stopPropagation();
+            e.preventDefault();
             erasePathsNear(getTransformedCoords(e.clientX, e.clientY));
         } else if (state.drawing.isDrawing) {
-            e.stopPropagation(); e.preventDefault();
+            e.stopPropagation();
+            e.preventDefault();
             const coords = getTransformedCoords(e.clientX, e.clientY);
             if (coords && state.drawing.currentPath) {
                 state.drawing.currentPath.points.push(coords);
@@ -470,13 +769,10 @@
         }
     }
 
-    // Handles Alt+mouseup:
-    // - finalize stroke
-    // - mark it ready to send
-    // - start batch timer
     function handleMouseUp(e) {
         if (state.drawing.isDrawing || state.drawing.isErasing) {
-            e.stopPropagation(); e.preventDefault();
+            e.stopPropagation();
+            e.preventDefault();
 
             const wasDrawing = state.drawing.isDrawing;
 
@@ -494,7 +790,6 @@
         }
     }
 
-    // Blocks the browser context menu when using Alt+RClick erase
     function handleContextMenu(e) {
         if (e.altKey) {
             e.preventDefault();
@@ -502,7 +797,6 @@
         }
     }
 
-    // Hooks mouse listeners into the game frame
     function addDrawingListeners(win) {
         win.addEventListener('mousedown', handleMouseDown, true);
         win.addEventListener('mousemove', handleMouseMove, true);
@@ -510,7 +804,6 @@
         win.addEventListener('contextmenu', handleContextMenu, true);
     }
 
-    // Unhooks mouse listeners from the game frame
     function removeDrawingListeners(win) {
         win.removeEventListener('mousedown', handleMouseDown, true);
         win.removeEventListener('mousemove', handleMouseMove, true);
@@ -518,7 +811,10 @@
         win.removeEventListener('contextmenu', handleContextMenu, true);
     }
 
-    // Draws the optional map grid overlay (if Grid: On)
+    /*****************************************************************
+     * 7. RENDERING
+     *****************************************************************/
+
     function drawGrid(viewport) {
         const { totalWidth, totalHeight, _scale: scale } = viewport;
         const gridSize = 100;
@@ -540,20 +836,19 @@
         ctx.stroke();
     }
 
-    // Draws one stroke (used twice: outline pass, color pass)
     function drawSinglePath(points, color, scale) {
         if (points.length === 0) return;
 
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
-        for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
+        for (let i = 1; i < points.length; i++) {
+            ctx.lineTo(points[i].x, points[i].y);
+        }
 
         ctx.strokeStyle = color;
         ctx.stroke();
     }
 
-    // Renders all visible player strokes to the overlay canvas
-    // (outline first, then their actual color)
     function updateCanvas(viewport) {
         const scale = viewport._scale;
 
@@ -589,15 +884,13 @@
         ctx.restore();
     }
 
-    // Default the HUD to collapsed on load
     uiContent.style.display = 'none';
     playersPanel.style.display = 'none';
     collapseBtn.textContent = '⯈';
 
-    // Main RAF loop that:
-    // - stays attached to the viewport
-    // - updates player list if new players draw
-    // - redraws canvas following camera position/zoom
+    /*****************************************************************
+     * 8. MAIN LOOP
+     *****************************************************************/
     function tick() {
         if (!state.attached) attach();
 

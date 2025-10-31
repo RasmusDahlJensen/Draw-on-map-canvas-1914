@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         S1914 Map Drawing Overlay (Synced via SignalR, Batched)
 // @namespace    1914.cam-hud.drawing.synced
-// @version      3.7.0
+// @version      3.9.0
 // @description  Map drawing overlay with line optimization, distance-based erasing, and server-push sync
 // @match        https://www.supremacy1914.com/*
 // @grant        none
@@ -61,9 +61,6 @@
     }
 
     function loadScript() {
-        /*****************************************************************
-         * 0. CONFIG
-         *****************************************************************/
         const CONFIG = {
             BATCH_WAIT_SECONDS: 5,
             HUB_URL: 'https://powerboys.noxiaz.dk:5006/drawingHub',
@@ -71,14 +68,10 @@
             ERASE_DISTANCE_UNITS: 50
         };
 
-        /*****************************************************************
-         * 1. BACKEND / SIGNALR
-         *****************************************************************/
         const backend = {
             connection: null,
             ready: false,
             _pendingInvokes: [],
-
             batchBuffers: {
                 createByPlayer: {},
                 updateByPlayer: {},
@@ -138,20 +131,13 @@
                 group.pathIds.delete(String(pathId));
             },
 
-            /**
-             * queueCreatePath:
-             * Called when we finish a brand new stroke,
-             * or when we split a path and spawn a new half.
-             */
             queueCreatePath(gameID, playerID, playerColor, pathObj) {
                 const pid = String(playerID);
-
                 this._removeFromDeletes(playerID, pathObj.id);
                 this._removeFromUpdates(playerID, pathObj.id);
                 this._ensureCreateGroup(gameID, playerID, playerColor);
 
                 const createGroup = this.batchBuffers.createByPlayer[pid];
-                // upsert into create list
                 const existingIdx = createGroup.paths.findIndex(
                     p => String(p.id) === String(pathObj.id)
                 );
@@ -167,11 +153,6 @@
                 }
             },
 
-            /**
-             * queueUpdatePath:
-             * Called when we partially erase a path and keep some of it.
-             * Keeps same path ID but fewer points.
-             */
             queueUpdatePath(gameID, playerID, pathObj) {
                 const pid = String(playerID);
 
@@ -190,7 +171,6 @@
                     }
                 }
 
-                // Normal case: queue an update
                 this._ensureUpdateGroup(gameID, playerID);
                 const updateGroup = this.batchBuffers.updateByPlayer[pid];
                 updateGroup.pathsById[String(pathObj.id)] = {
@@ -199,21 +179,12 @@
                 };
             },
 
-            /**
-             * queueDeletePath:
-             * Called when we erase an entire path from our local view.
-             */
             queueDeletePath(gameID, playerID, pathUID) {
                 const pid = String(playerID);
 
-                // If we had created this path in this batch and then deleted it,
-                // just cancel the create (don't bother telling backend).
                 this._removeFromCreates(playerID, pathUID);
-
-                // Also remove any pending updates for this path
                 this._removeFromUpdates(playerID, pathUID);
 
-                // Now mark it deleted
                 this._ensureDeleteGroup(gameID, playerID);
                 this.batchBuffers.deleteByPlayer[pid].pathIds.add(String(pathUID));
             },
@@ -224,7 +195,6 @@
                     return;
                 }
 
-                // snapshot and reset buffers
                 const creates = this.batchBuffers.createByPlayer;
                 const updates = this.batchBuffers.updateByPlayer;
                 const deletes = this.batchBuffers.deleteByPlayer;
@@ -235,39 +205,35 @@
                     deleteByPlayer: {}
                 };
 
-                // 1. send updates
                 for (const payload of Object.values(updates)) {
                     const pathArray = Object.values(payload.pathsById);
                     if (!pathArray.length) continue;
 
                     for (const p of pathArray) {
-                        // Build what the backend expects
                         const pathUID = String(p.id);
                         const pointsList = p.points.map(pt => ({
                             X: pt.x,
                             Y: pt.y
                         }));
 
-                        console.log('[SYNC] UpdatePath -> backend (one path)', {
+                        console.log('[SYNC] UpdatePath -> backend', {
                             gameID: payload.gameID,
                             playerID: payload.playerID,
                             pathUID: pathUID,
                             points: pointsList
                         });
 
-                        // this.connection.invoke(
-                        //     'UpdatePath',
-                        //     payload.gameID,        // long gameID
-                        //     payload.playerID,      // int playerID
-                        //     pathUID,               // string pathUID
-                        //     pointsList             // List<PathPoint> newPoints
-                        // )
-                        //     .catch(err => console.error('[SYNC] UpdatePath failed', err));
+                        this.connection.invoke(
+                            'UpdatePath',
+                            payload.gameID,
+                            payload.playerID,
+                            pathUID,
+                            pointsList
+                        )
+                            .catch(err => console.error('[SYNC] UpdatePath failed', err));
                     }
                 }
 
-
-                // 2. send creates
                 for (const payload of Object.values(creates)) {
                     if (!payload.paths || payload.paths.length === 0) continue;
 
@@ -280,52 +246,46 @@
                             }))
                         };
 
-                        console.log('[SYNC] CreatePath -> backend (one path)', {
+                        console.log('[SYNC] CreatePath -> backend', {
                             gameID: payload.gameID,
                             playerID: payload.playerID,
                             playerColor: payload.playerColor,
                             path: serverPath
                         });
 
-                        // this.connection.invoke(
-                        //   'CreatePath',
-                        //   payload.gameID,        // long gameID
-                        //   payload.playerID,      // int playerID
-                        //   payload.playerColor,   // string playerColor
-                        //   serverPath             // Models.Path
-                        // )
-                        // .catch(err => console.error('[SYNC] CreatePath failed', err));
+                        this.connection.invoke(
+                            'CreatePath',
+                            payload.gameID,
+                            payload.playerID,
+                            payload.playerColor,
+                            serverPath
+                        )
+                            .catch(err => console.error('[SYNC] CreatePath failed', err));
                     }
                 }
 
-                // 3. send deletes
                 for (const payload of Object.values(deletes)) {
                     const arrIds = Array.from(payload.pathIds);
                     if (!arrIds.length) continue;
 
                     for (const pathUID of arrIds) {
-                        console.log('[SYNC] DeletePath -> backend (one pathUID)', {
+                        console.log('[SYNC] DeletePath -> backend', {
                             gameID: payload.gameID,
                             playerID: payload.playerID,
                             pathUID: pathUID
                         });
 
-                        // this.connection.invoke(
-                        //     'DeletePath',
-                        //     payload.gameID,        // long gameID
-                        //     payload.playerID,      // int playerID
-                        //     String(pathUID)        // string pathUID
-                        // )
-                        //     .catch(err => console.error('[SYNC] DeletePath failed', err));
+                        this.connection.invoke(
+                            'DeletePath',
+                            payload.gameID,
+                            payload.playerID,
+                            String(pathUID)
+                        )
+                            .catch(err => console.error('[SYNC] DeletePath failed', err));
                     }
                 }
-
             },
 
-            /**
-             * applyFullStateFromBackend:
-             * Takes the result of GetAll() and hydrates local state.
-             */
             applyFullStateFromBackend(games) {
                 if (!games || !state.game.gameID) return;
                 const currentGameID = Number(state.game.gameID);
@@ -378,6 +338,114 @@
                 rebuildPlayersIfChanged();
             },
 
+            applyPathCreated(gameID, playerID, playerColor, serverPath) {
+                if (!state.game.gameID) return;
+                if (Number(gameID) !== Number(state.game.gameID)) return;
+
+                const pidNum = Number(playerID);
+                const pidKey = String(pidNum);
+                const uid = String(
+                    serverPath.PathUID ??
+                    serverPath.pathUID ??
+                    serverPath.id ??
+                    serverPath.ID ??
+                    serverPath.pathUid ??
+                    'unknown'
+                );
+
+                const ptsRaw = serverPath.Points ?? serverPath.points ?? [];
+                const pts = ptsRaw.map(pt => ({
+                    x: (pt.x !== undefined ? pt.x : pt.X),
+                    y: (pt.y !== undefined ? pt.y : pt.Y)
+                }));
+
+                if (!state.allDrawings[pidKey]) {
+                    state.allDrawings[pidKey] = {
+                        color: playerColor || '#FFFFFF',
+                        paths: []
+                    };
+                }
+
+                const existing = state.allDrawings[pidKey].paths.find(p => String(p.id) === uid);
+                if (existing) {
+                    existing.points = pts;
+                    existing.sent = true;
+                    existing.isFinal = true;
+                } else {
+                    state.allDrawings[pidKey].paths.push({
+                        id: uid,
+                        points: pts,
+                        sent: true,
+                        isFinal: true
+                    });
+                }
+
+                if (playerColor && playerColor !== state.allDrawings[pidKey].color) {
+                    state.allDrawings[pidKey].color = playerColor;
+                }
+
+                ensureVisibilityEntry(pidKey);
+                rebuildPlayersIfChanged();
+            },
+
+            applyPathUpdated(gameID, playerID, pathUID, pointsList) {
+                if (!state.game.gameID) return;
+                if (Number(gameID) !== Number(state.game.gameID)) return;
+
+                const pidNum = Number(playerID);
+                const pidKey = String(pidNum);
+                const uid = String(pathUID);
+
+                const pts = (pointsList || []).map(pt => ({
+                    x: (pt.x !== undefined ? pt.x : pt.X),
+                    y: (pt.y !== undefined ? pt.y : pt.Y)
+                }));
+
+                if (!state.allDrawings[pidKey]) {
+                    state.allDrawings[pidKey] = {
+                        color: '#FFFFFF',
+                        paths: []
+                    };
+                }
+
+                const existing = state.allDrawings[pidKey].paths.find(p => String(p.id) === uid);
+                if (existing) {
+                    existing.points = pts;
+                    existing.sent = true;
+                    existing.isFinal = true;
+                } else {
+                    state.allDrawings[pidKey].paths.push({
+                        id: uid,
+                        points: pts,
+                        sent: true,
+                        isFinal: true
+                    });
+                }
+
+                ensureVisibilityEntry(pidKey);
+                rebuildPlayersIfChanged();
+            },
+
+            applyPathDeleted(gameID, playerID, pathUID) {
+                if (!state.game.gameID) return;
+                if (Number(gameID) !== Number(state.game.gameID)) return;
+
+                const pidNum = Number(playerID);
+                const pidKey = String(pidNum);
+                const uid = String(pathUID);
+
+                if (!state.allDrawings[pidKey]) return;
+
+                const arr = state.allDrawings[pidKey].paths;
+                const idx = arr.findIndex(p => String(p.id) === uid);
+                if (idx >= 0) {
+                    arr.splice(idx, 1);
+                }
+
+                ensureVisibilityEntry(pidKey);
+                rebuildPlayersIfChanged();
+            },
+
             requestFullStateOnce() {
                 if (!this.ready) {
                     this._pendingInvokes.push(() => this.requestFullStateOnce());
@@ -386,16 +454,13 @@
 
                 this.connection.invoke('GetAll')
                     .then(games => {
-                        console.log('[SYNC] Initial GetAll <- backend', games);
+                        console.log('[SYNC] GetAll <- backend', games);
                         this.applyFullStateFromBackend(games);
                     })
                     .catch(err => console.error('[SYNC] GetAll failed', err));
             }
         };
 
-        /*****************************************************************
-         * SIGNALR CONNECTION
-         *****************************************************************/
         function ensureSignalRConnection() {
             if (backend.connection) return;
 
@@ -411,9 +476,24 @@
                     .withAutomaticReconnect()
                     .build();
 
-                backend.connection.on('FullStateSync', (games) => {
-                    console.log('[SYNC] FullStateSync <- backend', games);
-                    backend.applyFullStateFromBackend(games);
+                backend.connection.on('PathCreated', (gameID, playerID, playerColor, serverPath) => {
+                    console.log('[SYNC] PathCreated <- backend', { gameID, playerID, playerColor, serverPath });
+                    backend.applyPathCreated(gameID, playerID, playerColor, serverPath);
+                });
+
+                backend.connection.on('PathUpdated', (gameID, playerID, pathUID, pointsList) => {
+                    console.log('[SYNC] PathUpdated <- backend', { gameID, playerID, pathUID, pointsList });
+                    backend.applyPathUpdated(gameID, playerID, pathUID, pointsList);
+                });
+
+                backend.connection.on('PathDeleted', (gameID, playerID, pathUID) => {
+                    console.log('[SYNC] PathDeleted <- backend', { gameID, playerID, pathUID });
+                    backend.applyPathDeleted(gameID, playerID, pathUID);
+                });
+
+                backend.connection.onreconnected(() => {
+                    console.log('[SYNC] Reconnected, requesting full state');
+                    backend.requestFullStateOnce();
                 });
 
                 backend.connection.start()
@@ -436,9 +516,6 @@
             document.head.appendChild(script);
         }
 
-        /*****************************************************************
-         * 2. UI CREATION
-         *****************************************************************/
         const ui = document.createElement('div');
         ui.style.cssText = 'position:fixed;top:12px;left:12px;z-index:2147483647;display:flex;flex-direction:column;gap:6px;align-items:flex-start;background:rgba(0,0,0,.6);color:#fff;padding:8px 10px;border-radius:8px;font:12px/1.2 system-ui,ui-sans-serif;backdrop-filter:blur(4px)';
         document.body.appendChild(ui);
@@ -525,22 +602,37 @@
 
         uiContent.appendChild(controls);
 
-        // Overlay canvas
         const canvas = document.createElement('canvas');
         const ctx = canvas.getContext('2d');
-        canvas.style.cssText = 'position: fixed; top: 0; left: 0; z-index: 2147483646; pointer-events: none;';
-        document.body.appendChild(canvas);
+        canvas.style.cssText = 'position: absolute; top: 0; left: 0; pointer-events: none;';
+
+        const container = settings.document.getElementById('game_components');
 
         function resizeCanvas() {
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
+            if (container && canvas.parentElement === container) {
+                canvas.width = container.clientWidth;
+                canvas.height = container.clientHeight;
+            } else {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+            }
         }
+
+        if (container) {
+            if (getComputedStyle(container).position === 'static') {
+                container.style.position = 'relative';
+            }
+            container.appendChild(canvas);
+        } else {
+            console.error("Drawing Overlay Error: Could not find game container (#game_components). Falling back to body.");
+            canvas.style.position = 'fixed';
+            canvas.style.zIndex = '2147483646';
+            settings.document.body.appendChild(canvas);
+        }
+
         window.addEventListener('resize', resizeCanvas);
         resizeCanvas();
 
-        /*****************************************************************
-         * 3. STATE
-         *****************************************************************/
         const state = {
             attached: false,
             hupWin: null,
@@ -563,9 +655,6 @@
             batch: { timerId: null }
         };
 
-        /*****************************************************************
-         * 4. HELPERS
-         *****************************************************************/
         function tryGet(obj, path) {
             try { return path.split('.').reduce((o, k) => o && o[k], obj) ?? null; } catch { return null; }
         }
@@ -576,24 +665,17 @@
             return timestamp * 1_000 + randomPart;
         }
 
-        /**
-         * Calculates the squared distance between two points.
-         */
         function distance(p1, p2) {
             const dx = p1.x - p2.x;
             const dy = p1.y - p2.y;
             return Math.sqrt(dx * dx + dy * dy);
         }
 
-        /**
-         * Calculates the perpendicular distance from a point to a line segment.
-         * Used by the Ramer-Douglas-Peucker algorithm.
-         */
         function perpendicularDistance(point, lineStart, lineEnd) {
             let dx = lineEnd.x - lineStart.x;
             let dy = lineEnd.y - lineStart.y;
 
-            if (dx === 0 && dy === 0) { // lineStart and lineEnd are the same point
+            if (dx === 0 && dy === 0) {
                 dx = point.x - lineStart.x;
                 dy = point.y - lineStart.y;
                 return Math.sqrt(dx * dx + dy * dy);
@@ -618,9 +700,6 @@
             return Math.sqrt(dx * dx + dy * dy);
         }
 
-        /**
-         * Simplifies a path using the Ramer-Douglas-Peucker algorithm.
-         */
         function ramerDouglasPeucker(pointList, epsilon) {
             if (pointList.length < 3) {
                 return pointList;
@@ -649,7 +728,6 @@
 
             return results;
         }
-
 
         function framesSameOrigin() {
             const list = [];
@@ -733,9 +811,6 @@
             rebuildPlayersIfChanged();
         }
 
-        /*****************************************************************
-         * 5. UI HANDLERS
-         *****************************************************************/
         clearButton.addEventListener('click', () => {
             const pid = state.game.playerID;
             const gid = state.game.gameID;
@@ -833,9 +908,6 @@
             }
         }
 
-        /*****************************************************************
-         * 6. DRAW / ERASE + BATCHING
-         *****************************************************************/
         function getTransformedCoords(screenX, screenY) {
             const vp = state.drawing.viewport;
             if (!vp) return null;
@@ -846,7 +918,6 @@
             };
         }
 
-        // Erasing logic: decides whether to delete, shrink, or split paths
         function erasePathsNear(coords) {
             if (!coords || !state.drawing.viewport || !state.game.playerID) return;
             const myDrawings = state.allDrawings[state.game.playerID];
@@ -854,40 +925,49 @@
 
             const scale = state.drawing.viewport._scale;
             const eraseRadius = 15 / scale;
-            const eraseRadiusSq = eraseRadius * eraseRadius;
 
             for (let i = myDrawings.paths.length - 1; i >= 0; i--) {
                 const path = myDrawings.paths[i];
                 let hitIndex = -1;
+                let minDistanceToSegment = eraseRadius;
 
-                for (let j = 0; j < path.points.length; j++) {
-                    const point = path.points[j];
-                    const dx = point.x - coords.x;
-                    const dy = point.y - coords.y;
-                    if (dx * dx + dy * dy < eraseRadiusSq) {
-                        hitIndex = j;
-                        break;
+                for (let j = 0; j < path.points.length - 1; j++) {
+                    const p1 = path.points[j];
+                    const p2 = path.points[j + 1];
+                    const dist = perpendicularDistance(coords, p1, p2);
+
+                    if (dist < minDistanceToSegment) {
+                        minDistanceToSegment = dist;
+                        const d1 = distance(coords, p1);
+                        const d2 = distance(coords, p2);
+                        hitIndex = (d1 < d2) ? j : j + 1;
                     }
                 }
 
                 if (hitIndex === -1) continue;
 
-                // NEW: Find start/end indices based on distance, not point count
                 let distanceBefore = 0;
                 let startIndex = hitIndex;
-                while (startIndex > 0 && distanceBefore < CONFIG.ERASE_DISTANCE_UNITS / 2) {
-                    distanceBefore += distance(path.points[startIndex], path.points[startIndex - 1]);
+                while (startIndex > 0) {
+                    const nextSegmentLength = distance(path.points[startIndex], path.points[startIndex - 1]);
+                    if (distanceBefore + nextSegmentLength > CONFIG.ERASE_DISTANCE_UNITS / 2) {
+                        break;
+                    }
+                    distanceBefore += nextSegmentLength;
                     startIndex--;
                 }
 
                 let distanceAfter = 0;
                 let endIndex = hitIndex;
-                while (endIndex < path.points.length - 1 && distanceAfter < CONFIG.ERASE_DISTANCE_UNITS / 2) {
-                    distanceAfter += distance(path.points[endIndex], path.points[endIndex + 1]);
+                while (endIndex < path.points.length - 1) {
+                    const nextSegmentLength = distance(path.points[endIndex], path.points[endIndex + 1]);
+                    if (distanceAfter + nextSegmentLength > CONFIG.ERASE_DISTANCE_UNITS / 2) {
+                        break;
+                    }
+                    distanceAfter += nextSegmentLength;
                     endIndex++;
                 }
-                endIndex += 1; // Make endIndex exclusive for slice
-
+                endIndex += 1;
 
                 const pointsBefore = path.points.slice(0, startIndex);
                 const pointsAfter = path.points.slice(endIndex);
@@ -895,7 +975,6 @@
                 const keepBefore = pointsBefore.length > 1;
                 const keepAfter = pointsAfter.length > 1;
 
-                // CASE A: nothing left -> delete whole path
                 if (!keepBefore && !keepAfter) {
                     myDrawings.paths.splice(i, 1);
 
@@ -909,7 +988,6 @@
                     return;
                 }
 
-                // CASE B: exactly one remaining segment -> shrink original path
                 if (keepBefore ^ keepAfter) {
                     const remaining = keepBefore ? pointsBefore : pointsAfter;
 
@@ -928,13 +1006,11 @@
                     return;
                 }
 
-                // CASE C: both segments remain -> keep longer part in original, create new path with shorter part
                 const lenBefore = pointsBefore.length;
                 const lenAfter = pointsAfter.length;
                 const keepOnOriginal = lenBefore >= lenAfter ? pointsBefore : pointsAfter;
                 const spawnAsNew = lenBefore >= lenAfter ? pointsAfter : pointsBefore;
 
-                // update original with the longer portion
                 path.points = keepOnOriginal.slice();
                 path.isFinal = true;
                 path.sent = false;
@@ -946,7 +1022,6 @@
                 );
                 path.sent = true;
 
-                // create a brand new path from the other portion
                 const newPath = {
                     id: generateUniqueId(),
                     points: spawnAsNew.slice(),
@@ -1061,7 +1136,6 @@
                 const wasDrawing = state.drawing.isDrawing;
 
                 if (wasDrawing && state.drawing.currentPath) {
-                    // NEW: Optimize the path before finalizing it
                     if (state.drawing.currentPath.points.length > 2) {
                         state.drawing.currentPath.points = ramerDouglasPeucker(
                             state.drawing.currentPath.points,
@@ -1102,9 +1176,6 @@
             win.removeEventListener('contextmenu', handleContextMenu, true);
         }
 
-        /*****************************************************************
-         * 7. RENDERING
-         *****************************************************************/
         function drawGrid(viewport) {
             const { totalWidth, totalHeight, _scale: scale } = viewport;
             const gridSize = 100;
@@ -1142,20 +1213,18 @@
             }
 
             ctx.strokeStyle = color;
-            ctx.lineWidth = ctx.lineWidth; // explicit
+            ctx.lineWidth = ctx.lineWidth;
             ctx.stroke();
         }
 
         function updateCanvas(viewport) {
             const scale = viewport._scale;
 
-            // clear the canvas in screen space
             ctx.save();
             ctx.setTransform(1, 0, 0, 1, 0, 0);
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             ctx.restore();
 
-            // move into "world space"
             ctx.save();
             ctx.scale(scale, scale);
             ctx.translate(-viewport.rect.x, -viewport.rect.y);
@@ -1183,14 +1252,10 @@
             ctx.restore();
         }
 
-        // Default UI collapsed
         uiContent.style.display = 'none';
         playersPanel.style.display = 'none';
         collapseBtn.textContent = '⯈';
 
-        /*****************************************************************
-         * 8. MAIN LOOP
-         *****************************************************************/
         function tick() {
             if (!state.attached) attach();
 

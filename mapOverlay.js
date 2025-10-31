@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         S1914 Map Drawing Overlay (Synced via SignalR, Batched)
 // @namespace    1914.cam-hud.drawing.synced
-// @version      3.5.0
-// @description  Map drawing overlay with IDs, per-player visibility, batched create/update/delete to backend, and server-push sync
+// @version      3.6.0
+// @description  Map drawing overlay with line optimization, distance-based erasing, and server-push sync
 // @match        https://www.supremacy1914.com/*
 // @grant        none
 // @noframes
@@ -14,7 +14,9 @@
      *****************************************************************/
     const CONFIG = {
         BATCH_WAIT_SECONDS: 5,
-        HUB_URL: 'https://powerboys.noxiaz.dk:5006/drawingHub'
+        HUB_URL: 'https://powerboys.noxiaz.dk:5006/drawingHub',
+        OPTIMIZATION_TOLERANCE: 2.0, // Tolerance for line simplification. Higher = more simplified, fewer points.
+        ERASE_DISTANCE_UNITS: 50 // The length of the line segment to erase, in world units.
     };
 
     /*****************************************************************
@@ -201,14 +203,14 @@
                         points: pointsList
                     });
 
-                    this.connection.invoke(
-                        'UpdatePath',
-                        payload.gameID,        // long gameID
-                        payload.playerID,      // int playerID
-                        pathUID,               // string pathUID
-                        pointsList             // List<PathPoint> newPoints
-                    )
-                        .catch(err => console.error('[SYNC] UpdatePath failed', err));
+                    // this.connection.invoke(
+                    //     'UpdatePath',
+                    //     payload.gameID,        // long gameID
+                    //     payload.playerID,      // int playerID
+                    //     pathUID,               // string pathUID
+                    //     pointsList             // List<PathPoint> newPoints
+                    // )
+                    //     .catch(err => console.error('[SYNC] UpdatePath failed', err));
                 }
             }
 
@@ -233,14 +235,14 @@
                         path: serverPath
                     });
 
-                    this.connection.invoke(
-                        'CreatePath',
-                        payload.gameID,        // long gameID
-                        payload.playerID,      // int playerID
-                        payload.playerColor,   // string playerColor
-                        serverPath             // Models.Path
-                    )
-                        .catch(err => console.error('[SYNC] CreatePath failed', err));
+                    // this.connection.invoke(
+                    //   'CreatePath',
+                    //   payload.gameID,        // long gameID
+                    //   payload.playerID,      // int playerID
+                    //   payload.playerColor,   // string playerColor
+                    //   serverPath             // Models.Path
+                    // )
+                    // .catch(err => console.error('[SYNC] CreatePath failed', err));
                 }
             }
 
@@ -256,13 +258,13 @@
                         pathUID: pathUID
                     });
 
-                    this.connection.invoke(
-                        'DeletePath',
-                        payload.gameID,        // long gameID
-                        payload.playerID,      // int playerID
-                        String(pathUID)        // string pathUID
-                    )
-                        .catch(err => console.error('[SYNC] DeletePath failed', err));
+                    // this.connection.invoke(
+                    //     'DeletePath',
+                    //     payload.gameID,        // long gameID
+                    //     payload.playerID,      // int playerID
+                    //     String(pathUID)        // string pathUID
+                    // )
+                    //     .catch(err => console.error('[SYNC] DeletePath failed', err));
                 }
             }
 
@@ -522,6 +524,81 @@
         return timestamp * 1_000 + randomPart;
     }
 
+    /**
+     * Calculates the squared distance between two points.
+     */
+    function distance(p1, p2) {
+        const dx = p1.x - p2.x;
+        const dy = p1.y - p2.y;
+        return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    /**
+     * Calculates the perpendicular distance from a point to a line segment.
+     * Used by the Ramer-Douglas-Peucker algorithm.
+     */
+    function perpendicularDistance(point, lineStart, lineEnd) {
+        let dx = lineEnd.x - lineStart.x;
+        let dy = lineEnd.y - lineStart.y;
+
+        if (dx === 0 && dy === 0) { // lineStart and lineEnd are the same point
+            dx = point.x - lineStart.x;
+            dy = point.y - lineStart.y;
+            return Math.sqrt(dx * dx + dy * dy);
+        }
+
+        const t = ((point.x - lineStart.x) * dx + (point.y - lineStart.y) * dy) / (dx * dx + dy * dy);
+
+        let closestX, closestY;
+        if (t < 0) {
+            closestX = lineStart.x;
+            closestY = lineStart.y;
+        } else if (t > 1) {
+            closestX = lineEnd.x;
+            closestY = lineEnd.y;
+        } else {
+            closestX = lineStart.x + t * dx;
+            closestY = lineStart.y + t * dy;
+        }
+
+        dx = point.x - closestX;
+        dy = point.y - closestY;
+        return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    /**
+     * Simplifies a path using the Ramer-Douglas-Peucker algorithm.
+     */
+    function ramerDouglasPeucker(pointList, epsilon) {
+        if (pointList.length < 3) {
+            return pointList;
+        }
+
+        let dmax = 0;
+        let index = 0;
+        const end = pointList.length - 1;
+
+        for (let i = 1; i < end; i++) {
+            const d = perpendicularDistance(pointList[i], pointList[0], pointList[end]);
+            if (d > dmax) {
+                index = i;
+                dmax = d;
+            }
+        }
+
+        let results = [];
+        if (dmax > epsilon) {
+            const recResults1 = ramerDouglasPeucker(pointList.slice(0, index + 1), epsilon);
+            const recResults2 = ramerDouglasPeucker(pointList.slice(index, end + 1), epsilon);
+            results = recResults1.slice(0, recResults1.length - 1).concat(recResults2);
+        } else {
+            results = [pointList[0], pointList[end]];
+        }
+
+        return results;
+    }
+
+
     function framesSameOrigin() {
         const list = [];
         try { if (window && window.document) list.push({ win: window, tag: 'top' }); } catch { }
@@ -726,7 +803,6 @@
         const scale = state.drawing.viewport._scale;
         const eraseRadius = 15 / scale;
         const eraseRadiusSq = eraseRadius * eraseRadius;
-        const ERASE_CHUNK_SIZE = 20;
 
         for (let i = myDrawings.paths.length - 1; i >= 0; i--) {
             const path = myDrawings.paths[i];
@@ -744,10 +820,22 @@
 
             if (hitIndex === -1) continue;
 
-            // slice out a chunk around the hit point
-            const halfChunk = Math.floor(ERASE_CHUNK_SIZE / 2);
-            const startIndex = Math.max(0, hitIndex - halfChunk);
-            const endIndex = Math.min(path.points.length, hitIndex + halfChunk);
+            // NEW: Find start/end indices based on distance, not point count
+            let distanceBefore = 0;
+            let startIndex = hitIndex;
+            while (startIndex > 0 && distanceBefore < CONFIG.ERASE_DISTANCE_UNITS / 2) {
+                distanceBefore += distance(path.points[startIndex], path.points[startIndex - 1]);
+                startIndex--;
+            }
+
+            let distanceAfter = 0;
+            let endIndex = hitIndex;
+            while (endIndex < path.points.length - 1 && distanceAfter < CONFIG.ERASE_DISTANCE_UNITS / 2) {
+                distanceAfter += distance(path.points[endIndex], path.points[endIndex + 1]);
+                endIndex++;
+            }
+            endIndex += 1; // Make endIndex exclusive for slice
+
 
             const pointsBefore = path.points.slice(0, startIndex);
             const pointsAfter = path.points.slice(endIndex);
@@ -921,6 +1009,13 @@
             const wasDrawing = state.drawing.isDrawing;
 
             if (wasDrawing && state.drawing.currentPath) {
+                // NEW: Optimize the path before finalizing it
+                if (state.drawing.currentPath.points.length > 2) {
+                    state.drawing.currentPath.points = ramerDouglasPeucker(
+                        state.drawing.currentPath.points,
+                        CONFIG.OPTIMIZATION_TOLERANCE
+                    );
+                }
                 state.drawing.currentPath.isFinal = true;
             }
 

@@ -237,54 +237,46 @@
                 for (const payload of Object.values(creates)) {
                     if (!payload.paths || payload.paths.length === 0) continue;
 
-                    for (const p of payload.paths) {
-                        const serverPath = {
-                            PathUID: String(p.id),
-                            Points: p.points.map(pt => ({
-                                X: pt.x,
-                                Y: pt.y
-                            }))
-                        };
+                    const serverCreates = payload.paths.map(p => ({
+                        PathUID: String(p.id),
+                        Points: p.points.map(pt => ({ X: pt.x, Y: pt.y }))
+                    }));
 
-                        console.log('[SYNC] CreatePath -> backend', {
-                            gameID: payload.gameID,
-                            playerID: payload.playerID,
-                            playerColor: payload.playerColor,
-                            path: serverPath
-                        });
+                    console.log('[SYNC] CreatePaths -> backend', {
+                        gameID: payload.gameID,
+                        playerID: payload.playerID,
+                        playerColor: payload.playerColor,
+                        paths: serverCreates
+                    });
 
-                        this.connection.invoke(
-                            'CreatePath',
-                            payload.gameID,
-                            payload.playerID,
-                            payload.playerColor,
-                            serverPath
-                        )
-                            .catch(err => console.error('[SYNC] CreatePath failed', err));
-                    }
+                    this.connection.invoke(
+                        'CreatePaths',
+                        payload.gameID,
+                        payload.playerID,
+                        payload.playerColor,
+                        serverCreates
+                    ).catch(err => console.error('[SYNC] CreatePaths failed', err));
                 }
 
                 for (const payload of Object.values(deletes)) {
                     const arrIds = Array.from(payload.pathIds);
                     if (!arrIds.length) continue;
 
-                    for (const pathUID of arrIds) {
-                        console.log('[SYNC] DeletePath -> backend', {
-                            gameID: payload.gameID,
-                            playerID: payload.playerID,
-                            pathUID: pathUID
-                        });
+                    console.log('[SYNC] DeletePaths -> backend', {
+                        gameID: payload.gameID,
+                        playerID: payload.playerID,
+                        pathUIDs: arrIds
+                    });
 
-                        this.connection.invoke(
-                            'DeletePath',
-                            payload.gameID,
-                            payload.playerID,
-                            String(pathUID)
-                        )
-                            .catch(err => console.error('[SYNC] DeletePath failed', err));
-                    }
+                    this.connection.invoke(
+                        'DeletePaths',
+                        payload.gameID,
+                        payload.playerID,
+                        arrIds.map(id => String(id))
+                    ).catch(err => console.error('[SYNC] DeletePaths failed', err));
                 }
-            },
+            }
+            ,
 
             applyFullStateFromBackend(games) {
                 if (!games || !state.game.gameID) return;
